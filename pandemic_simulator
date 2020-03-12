@@ -1,0 +1,392 @@
+#!/usr/bin/env python3
+#
+#Copyrigh (C) 2020 Brett A. Thomas. <quark@baz.com>
+#Released under the terms of the MIT license:
+#  https://choosealicense.com/licenses/mit/
+
+import argparse
+import datetime
+import math
+from decimal import Decimal
+from datetime import timedelta
+
+def human_format(n):
+    """Format a number for human-readibility; e.g., turn 1000000 into 1.00M
+    Inspired by many sources but most directly by 
+    https://github.com/azaitsev/millify
+
+    This was also released under the MIT license so my modification
+    and inclusion here should be compatible with that."""
+
+    #Don't need to go over billions unless we colonize another planet
+    names = ['', 'k', 'M', 'B']
+
+    #Figure out what postfix we're using, if any:
+    index = max(0,
+                min(len(names) - 1,
+                    int(math.floor(0 if n == 0 else math.log10(abs(n)) / 3))))
+
+    #Format the prefix, zero-padded
+    result = "%0.2f" % (n / 10 ** (3 * index))
+
+    #Remove the exponent, if any:
+    result = Decimal(result)
+
+    if result.to_integral() == result:
+        result = Decimal(result).quantize(Decimal(1))
+
+    #And, assemble the string.
+    return str(result) + names[index]
+        
+def find_hourly_increase(days_to_double):
+    """This program takes the number of days it takes to double the infected
+    population as an argument, but internally we need to calculate the
+    percentage increase per hour so that we can model the hospital population
+    growth.
+
+    I am unaware of a purely mathematical way to calculate this, so this method
+    performs a rough binary search to determine this.
+    """
+    
+    #Start with an arbitrary date (we don't care about the date, just the hour,
+    #but we should leverage the datetime infrastructure for ease of use)
+    start = datetime.datetime(year = 2020, month = 1, day = 1)
+    end = start + timedelta(days = days_to_double)
+
+    #Six figures chosen arbitrarily as "enough precision"
+    base_population = 100000
+
+    #Our goal for what the population increase we want to see:
+    expected_population_increase = base_population * 2
+
+    #We'll start with a linear increase per hour. It'll be wrong, but
+    #we know it's not MORE than this
+    linear_increase = (expected_population_increase / \
+                       (days_to_double * 24)) / base_population
+
+    #Remember how much we increased last run:
+    last_increase = linear_increase
+
+    #What the increase is; will be our return value
+    increase = None
+
+    #What the error is between the simulated population and the expected:
+    error = None
+
+    #The change we're making in increase this loop:
+    delta = None
+
+    #Have we gone negative yet? See comment below
+    gone_negative = False
+
+    #Keep track of the last error we calculated. Floating point
+    #precision can causes us to end up looping forever between a
+    #few values; if we get the same answer two loops in a row, bail out
+    last_error = None
+
+    #Run this while we've got an error and we haven't repeated a result:
+    while error != 0 and (last_error is None or last_error != error):
+        #Save the previous error so we can compare it later:
+        last_error = error
+
+        #Reset the population to the beginning of the simulation:
+        population = base_population
+
+        if increase is None:
+            #This is our first loop. We know we're WAY high, so
+            #let's start at half the linear increase:
+            increase = linear_increase
+            delta = increase / 2
+        else:
+            #Not our first loop. If this is our second loop, we're
+            #still probably WAY high. We want to keep cutting
+            #our value in half until we drop below zero, then we'll
+            #switch to a binary search:
+            if not gone_negative:
+                delta = -(increase / 2)
+            else:
+                delta = abs(delta) / 2
+                
+                if error > 0:
+                    #We've got a positive error, we want to go down
+                    delta = - delta
+
+            #Add (or subtract) the delta from the increase
+            increase += delta
+
+        #Cursor we'll use to walk the hours from start to end:
+        cursor = start
+
+        #Increment the cursor hourly for the duration and calculate how much
+        #the population increases
+        while cursor <= end:
+            population += population * increase
+            cursor += timedelta(hours = 1)
+
+        #How close were we to the target?
+        error = population - expected_population_increase
+
+        #Finally, if we haven't yet gone to less than zero, see
+        #if this is the magic moment:
+        if not gone_negative and error < 0:
+            gone_negative = True
+
+    return increase
+
+def calculate_currently_hospitalized(today,
+                                     hospitalized,
+                                     hospitalized_death_rate,
+                                     mean_hospital_stay):
+    """Look back at the record of previous hospitalizations, and
+    calculate both the number of people currently hospitalized, and
+    the number of people who died today.
+
+    This model is very simple and is one of the best places to improve
+    this program. It assumes that the mean hospital stay is as
+    specified, and that at the end of that stay, <hospitalized_death_rate>
+    of the patients die.
+
+    A more robust version might do a Monte Carlo simulation for
+    all (or a sample) of the patients and simulate various stay lengths
+    and death times.
+    """
+
+    #Optimistic start!
+    currently_hospitalized = 0
+
+    #Also optimistic!
+    dead = 0
+
+    #Walk the hospitalized list backward:
+    for day in hospitalized[::-1]:
+        #Are we at the end?
+        if today - day['day'] > timedelta(days = mean_hospital_stay):
+            #Calculate the dead and drop out. We don't add to the
+            #number hospitalized becase this is the end of the stay;
+            #on this day you are either dead or discharged.
+            dead += day['hospitalized'] * args.hospitalized_death_rate
+            break
+
+        #Not at the end, increase the number hospitalized
+        currently_hospitalized += day['hospitalized']
+
+    return currently_hospitalized, dead
+
+def output_record(date, infected, currently_hospitalized, dead):
+        print(f"%04i-%02i-%02i %7s %7s %7s" % \
+              (date.year,
+               date.month,
+               date.day,
+               human_format(int(infected)),
+               human_format(int(currently_hospitalized)),
+               human_format(int(dead))))
+
+def find_patient_one(initial_infections, specified_start, hourly_delta):
+    """Run the simulation backward until we get to a single
+    patient, then return that as a start date so we can simulate
+    all the results prior to requested start"""
+
+    true_start = specified_start
+    infected = initial_infections
+
+    #Walk backward until we have a single case
+    while infected > 1:
+        infected -= infected * hourly_delta
+
+        true_start -= timedelta(hours = 1)
+
+    #Move the start to the beginning of the day so we're alway
+    #doing a full day
+    true_start.replace(hour = 0, minute = 0, second = 0)
+        
+    return true_start
+    
+#Default start and Initial Population from:
+#https://www.cedars-sinai.org/newsroom/study-estimates-covid-19-may-have-infected-over-9000-in-us/
+default_start = '2020-03-01'
+default_initial_population = 9000
+
+#If we haven't hit the end infected goal by this point, end.
+default_end = '2020-09-01'
+
+#Default doubling rate. Apparently 6.2 is a rule-of-thumb number
+#for influenza. I've chosen 4.5 after analyzing the Italy data from
+#https://covid19.nguy.dev/
+#Specifically, the "Confirmed" number from 20200215 - 20200308
+default_doubling_rate = 4.5
+
+#Assume 10% of US population is infected. This is probably
+#low, but as we approach this people should change their
+#behavior and infection rates should slow, which is beyond
+#the scope of this primitive tool.
+#
+#Worst-case estimates end with 60 - 70% of the US population
+#infected, which would be...bad.
+default_target_infected_population = 300000000 * .1
+
+#By default, 10% of cases are hospitalized:
+default_hospitalization_rate = .1
+
+#By default, if you are hospitalized, you have a 10% chance of dying.
+#This comes out to a total morbidity rate of 1%, which is conservative.
+default_hospitalized_death_rate = .1
+
+#Mean hospital stay in days:
+default_mean_hospital_stay = 7
+
+#Let the user override all the above with arguments:
+parser = argparse.ArgumentParser(description = \
+                               "A hacky tool to simulate pandemic growth")
+
+parser.add_argument('--start',
+                    type=lambda s: datetime.datetime.strptime(s, '%Y-%m-%d'),
+                    default = \
+                    datetime.datetime.strptime(default_start, '%Y-%m-%d'),
+                    help = f'Simulation start date. Default is {default_start}')
+
+parser.add_argument('--end',
+                    type=lambda s: datetime.datetime.strptime(s, '%Y-%m-%d'),
+                    default = \
+                    datetime.datetime.strptime(default_end, '%Y-%m-%d'),
+                    help = f'Simulation end date. Default is {default_end}')
+
+parser.add_argument('--infected',
+                    type = int,
+                    default  = default_target_infected_population,
+                    help = 'Final infected population. Default is ' + \
+                    str(int(default_target_infected_population)))
+
+parser.add_argument('--initial', type=int,
+                    default = default_initial_population,
+                    help = 'Initial infected population. Default is ' + \
+                    str(default_initial_population))
+
+parser.add_argument('--daily', action='store_true',
+                    help = 'Output daily information instead of weekly')
+                    
+                  
+parser.add_argument('--doubling',
+                    type = float,
+                    default  = default_doubling_rate,
+                    help = 'Number of days it takes for infected ' + \
+                    'population to double. Default is ' + \
+                    str(default_doubling_rate))
+
+parser.add_argument('--mean-hospital-stay',
+                    type = int,
+                    default  = default_mean_hospital_stay,
+                    help = 'Mean length of a hospital stay ' + \
+                    'Default is ' + str(default_mean_hospital_stay))
+
+parser.add_argument('--hospitalization-rate',
+                    type = int,
+                    default  = default_hospitalization_rate,
+                    help = 'Rate at which infected are hospitalized. ' + \
+                    'Default is ' + str(default_hospitalization_rate))
+
+parser.add_argument('--hospitalized-death-rate',
+                    type = int,
+                    default  = default_hospitalized_death_rate,
+                    help = 'Rate at which hospitalized die. Default is ' + \
+                    str(default_hospitalized_death_rate))
+
+#Might be nice to catch exceptions on the lambdas here and give
+#pretty error messages
+args = parser.parse_args()
+
+#*Should* already be midnight? But just in case:
+args.start.replace(hour = 0, minute = 0, second = 0)
+
+#Figure out how doubling per day translates into an hourly
+#increase:
+hourly_increase = find_hourly_increase(args.doubling)
+
+#The cursor we'll use to walk to the time from start to end:
+date_cursor = find_patient_one(args.initial, args.start, hourly_increase)
+
+#And since we found patient one, we have one patient
+infected = 1
+
+#Output the header
+print(f"DATE      INFECTED    HOSP    DEAD")
+
+#List of hospitalized per-day
+hospitalized = []
+
+#Stack the bodies up
+dead = 0
+
+#Loop until we either kill enough people or run out the clock
+while date_cursor < args.end and infected < args.infected:
+    #Increment the cursor by an hour
+    date_cursor += timedelta(hours = 1)
+
+    #How many new sick people this hour?
+    newly_infected = infected * hourly_increase
+
+    #We store this by day, not by hour, so let's
+    #get a handle to the date:
+    hosp_day = date_cursor
+    hosp_day = hosp_day.replace(hour = 0, minute = 0, second = 0)
+
+    #Do we already have a record for today?
+    if len(hospitalized) and hospitalized[-1]['day'] == hosp_day:
+        #Yes, we do. Increment it to this new happy number!
+        hospitalized[-1]['hospitalized'] += \
+            newly_infected * args.hospitalization_rate
+    else:
+        #First entry of the day (or ever):
+        hospitalized.append({'day' : hosp_day,
+                             'hospitalized' : newly_infected * \
+                             args.hospitalization_rate})
+
+    #Tally the unfortunate:
+    infected += newly_infected
+
+    #If we're midnight on a daily output, or midnight on Monday on
+    #a weekly output, let's tally the dead / hospitalized, and output
+    #something:
+    if (args.daily or date_cursor.weekday() == 0) and date_cursor.hour == 23:
+        #Figure out today's body count
+        currently_hospitalized, newly_dead =\
+            calculate_currently_hospitalized(hosp_day,
+                                             hospitalized,
+                                             args.hospitalized_death_rate,
+                                             args.mean_hospital_stay)
+
+        #Increment the running total of dead
+        dead += newly_dead
+
+        output_record(date_cursor, infected, currently_hospitalized, dead)
+
+
+if date_cursor < args.end:
+    #We bailed out of the loop because we hit the target population.
+    #Now, let's just simulate the tail of the hospitalized and
+    #sick at the end:
+    date_cursor.replace(hour = 0, minute = 0, second = 0)
+
+    boom = 0
+    
+    while currently_hospitalized > 0:
+        hospitalized.append({'day' : date_cursor,
+                             'hospitalized' : 0})
+
+        currently_hospitalized, newly_dead =\
+            calculate_currently_hospitalized(date_cursor,
+                                             hospitalized,
+                                             args.hospitalized_death_rate,
+                                             args.mean_hospital_stay)
+
+        dead += newly_dead
+
+        output_record(date_cursor, infected, currently_hospitalized, dead)
+
+        date_cursor += timedelta(days = 1)
+
+        boom += 1
+
+        if boom > 10:
+            print(hospitalized)
+            exit(0)
+     
