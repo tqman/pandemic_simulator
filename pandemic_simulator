@@ -380,7 +380,8 @@ if date_cursor < args.end:
 
         dead += newly_dead
 
-        output_record(date_cursor, infected, currently_hospitalized, dead)
+        if args.daily or date_cursor.weekday() == 0:
+            output_record(date_cursor, infected, currently_hospitalized, dead)
 
         date_cursor += timedelta(days = 1)
 
@@ -389,4 +390,10 @@ if date_cursor < args.end:
         if boom > 10:
             print(hospitalized)
             exit(0)
-     
+
+
+#If we're in weekly mode we might have a final record we'd like
+#to output at the end if we didn't happen to end on a Monday:
+if not args.daily and date_cursor.weekday() != 0:
+    output_record(date_cursor, infected, currently_hospitalized, dead)
+        
